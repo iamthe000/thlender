@@ -1,4 +1,346 @@
 <!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Scene Builder & Generator</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        
+        /* Code Modal */
+        #code-modal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); z-index: 1000; justify-content: center; align-items: center;
+        }
+        #code-content {
+            background: #2b2b2b; width: 80%; height: 80%; padding: 20px; border-radius: 8px;
+            display: flex; flex-direction: column; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        #generated-code {
+            flex: 1; background: #111; color: #a6e22e; border: none; padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace; resize: none; border-radius: 4px; outline: none;
+        }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; color: #fff; }
+        .btn {
+            background: #444; color: #fff; border: none; padding: 8px 16px; cursor: pointer; border-radius: 4px;
+            font-weight: bold; transition: 0.2s;
+        }
+        .btn:hover { background: #666; }
+        .btn-primary { background: #007acc; }
+        .btn-primary:hover { background: #005f9e; }
+        
+        /* Instructions Overlay */
+        #overlay {
+            position: absolute; bottom: 20px; left: 20px; pointer-events: none; color: #888; font-size: 12px;
+            background: rgba(0,0,0,0.6); padding: 10px; border-radius: 4px;
+        }
+        kbd { background: #444; padding: 2px 5px; border-radius: 3px; color: #eee; }
+    </style>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <div id="overlay">
+        <div><strong>Shortcuts:</strong></div>
+        <div><kbd>T</kbd> Translate (Move)</div>
+        <div><kbd>R</kbd> Rotate</div>
+        <div><kbd>S</kbd> Scale</div>
+        <div><kbd>Del</kbd> / <kbd>Backspace</kbd> Delete Object</div>
+        <div><kbd>+</kbd> Toggle Local/World</div>
+    </div>
+
+    <div id="code-modal">
+        <div id="code-content">
+            <div class="modal-header">
+                <h3>Generated Three.js Code</h3>
+                <div>
+                    <button class="btn" onclick="document.getElementById('code-modal').style.display='none'">Close</button>
+                    <button class="btn btn-primary" id="copy-btn">Copy to Clipboard</button>
+                </div>
+            </div>
+            <textarea id="generated-code" readonly></textarea>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { TransformControls } from 'three/addons/controls/TransformControls.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+        
+        // Grid & Helpers
+        const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x333333);
+        scene.add(gridHelper);
+        const axesHelper = new THREE.AxesHelper(5);
+        scene.add(axesHelper);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(5, 5, 10);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(5, 10, 7);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        // --- Controls ---
+        const orbit = new OrbitControls(camera, renderer.domElement);
+        orbit.enableDamping = true;
+
+        const transformControl = new TransformControls(camera, renderer.domElement);
+        transformControl.addEventListener('dragging-changed', function (event) {
+            orbit.enabled = !event.value;
+        });
+        scene.add(transformControl);
+
+        // --- State Management ---
+        const objects = []; // User created objects
+        let selectedObject = null;
+
+        // --- GUI Setup ---
+        const gui = new GUI({ title: 'Editor' });
+        const params = {
+            objectType: 'Box',
+            color: '#00ff00',
+            wireframe: false,
+            addObject: () => addObject(params.objectType),
+            generate: () => generateCode()
+        };
+
+        // Creator Folder
+        const creatorFolder = gui.addFolder('Create');
+        creatorFolder.add(params, 'objectType', ['Box', 'Sphere', 'Plane', 'Torus', 'Cylinder']);
+        creatorFolder.addColor(params, 'color').name('Default Color');
+        creatorFolder.add(params, 'addObject').name('Add Object');
+
+        // Properties Folder
+        const propFolder = gui.addFolder('Properties');
+        const props = {
+            x: 0, y: 0, z: 0,
+            rx: 0, ry: 0, rz: 0,
+            sx: 1, sy: 1, sz: 1,
+            color: '#ffffff',
+            wireframe: false,
+            visible: true
+        };
+        
+        const ctrlRefs = {}; // Store controller references to update them
+
+        function setupPropGUI() {
+            // Position
+            ctrlRefs.x = propFolder.add(props, 'x').name('Pos X').onChange(v => updateSelected('pos'));
+            ctrlRefs.y = propFolder.add(props, 'y').name('Pos Y').onChange(v => updateSelected('pos'));
+            ctrlRefs.z = propFolder.add(props, 'z').name('Pos Z').onChange(v => updateSelected('pos'));
+            
+            // Rotation (Degrees in UI, Radians in Three)
+            ctrlRefs.rx = propFolder.add(props, 'rx').name('Rot X').onChange(v => updateSelected('rot'));
+            ctrlRefs.ry = propFolder.add(props, 'ry').name('Rot Y').onChange(v => updateSelected('rot'));
+            ctrlRefs.rz = propFolder.add(props, 'rz').name('Rot Z').onChange(v => updateSelected('rot'));
+
+            // Scale
+            ctrlRefs.sx = propFolder.add(props, 'sx').name('Scale X').onChange(v => updateSelected('scale'));
+            ctrlRefs.sy = propFolder.add(props, 'sy').name('Scale Y').onChange(v => updateSelected('scale'));
+            ctrlRefs.sz = propFolder.add(props, 'sz').name('Scale Z').onChange(v => updateSelected('scale'));
+
+            // Material
+            ctrlRefs.color = propFolder.addColor(props, 'color').onChange(v => updateSelected('mat'));
+            ctrlRefs.wireframe = propFolder.add(props, 'wireframe').onChange(v => updateSelected('mat'));
+            ctrlRefs.visible = propFolder.add(props, 'visible').onChange(v => updateSelected('vis'));
+        }
+        setupPropGUI();
+
+        const outputFolder = gui.addFolder('Export');
+        outputFolder.add(params, 'generate').name('Generate Code');
+
+        // --- Core Logic ---
+
+        function addObject(type) {
+            let geometry;
+            const material = new THREE.MeshStandardMaterial({ 
+                color: params.color, 
+                side: THREE.DoubleSide 
+            });
+
+            switch(type) {
+                case 'Box': geometry = new THREE.BoxGeometry(1, 1, 1); break;
+                case 'Sphere': geometry = new THREE.SphereGeometry(0.6, 32, 16); break;
+                case 'Plane': geometry = new THREE.PlaneGeometry(2, 2); material.side = THREE.DoubleSide; break;
+                case 'Torus': geometry = new THREE.TorusGeometry(0.5, 0.2, 16, 50); break;
+                case 'Cylinder': geometry = new THREE.CylinderGeometry(0.5, 0.5, 1, 32); break;
+            }
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            mesh.position.y = 0.5;
+            mesh.userData.type = type; // Keep track of type for export
+            
+            scene.add(mesh);
+            objects.push(mesh);
+            selectObject(mesh);
+        }
+
+        function selectObject(mesh) {
+            selectedObject = mesh;
+            transformControl.attach(mesh);
+            syncGUI();
+        }
+
+        function syncGUI() {
+            if (!selectedObject) return;
+            
+            props.x = selectedObject.position.x;
+            props.y = selectedObject.position.y;
+            props.z = selectedObject.position.z;
+
+            props.rx = selectedObject.rotation.x * (180/Math.PI);
+            props.ry = selectedObject.rotation.y * (180/Math.PI);
+            props.rz = selectedObject.rotation.z * (180/Math.PI);
+
+            props.sx = selectedObject.scale.x;
+            props.sy = selectedObject.scale.y;
+            props.sz = selectedObject.scale.z;
+
+            props.color = '#' + selectedObject.material.color.getHexString();
+            props.wireframe = selectedObject.material.wireframe;
+            props.visible = selectedObject.visible;
+
+            // Update UI displays
+            for (let key in ctrlRefs) ctrlRefs[key].updateDisplay();
+        }
+
+        function updateSelected(mode) {
+            if (!selectedObject) return;
+            if (mode === 'pos') {
+                selectedObject.position.set(props.x, props.y, props.z);
+            } else if (mode === 'rot') {
+                selectedObject.rotation.set(
+                    props.rx * (Math.PI/180),
+                    props.ry * (Math.PI/180),
+                    props.rz * (Math.PI/180)
+                );
+            } else if (mode === 'scale') {
+                selectedObject.scale.set(props.sx, props.sy, props.sz);
+            } else if (mode === 'mat') {
+                selectedObject.material.color.set(props.color);
+                selectedObject.material.wireframe = props.wireframe;
+            } else if (mode === 'vis') {
+                selectedObject.visible = props.visible;
+            }
+        }
+
+        // Raycasting for selection
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('mousedown', (event) => {
+            // Only select if not clicking on UI
+            if (event.target.closest('.lil-gui')) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(objects);
+
+            if (intersects.length > 0) {
+                selectObject(intersects[0].object);
+            } else {
+                // Deselect if clicking empty space (optional, usually annoying in editors)
+                // transformControl.detach();
+                // selectedObject = null;
+            }
+        });
+
+        transformControl.addEventListener('change', syncGUI);
+
+        // Keyboard Shortcuts
+        window.addEventListener('keydown', function(event) {
+            switch(event.key.toLowerCase()) {
+                case 't': transformControl.setMode('translate'); break;
+                case 'r': transformControl.setMode('rotate'); break;
+                case 's': transformControl.setMode('scale'); break;
+                case '+': transformControl.setSpace(transformControl.space === 'local' ? 'world' : 'local'); break;
+                case 'delete':
+                case 'backspace':
+                    if (selectedObject) {
+                        scene.remove(selectedObject);
+                        transformControl.detach();
+                        objects.splice(objects.indexOf(selectedObject), 1);
+                        selectedObject = null;
+                    }
+                    break;
+            }
+        });
+
+        // Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Code Generator ---
+        function generateCode() {
+            let meshCode = '';
+
+            objects.forEach((obj, index) => {
+                if (!obj.visible) return;
+
+                const p = obj.position;
+                const r = obj.rotation;
+                const s = obj.scale;
+                const c = obj.material.color.getHexString();
+                const type = obj.userData.type || 'Box';
+                
+                let geoStr = '';
+                switch(type) {
+                    case 'Box': geoStr = `new THREE.BoxGeometry(1, 1, 1)`; break;
+                    case 'Sphere': geoStr = `new THREE.SphereGeometry(0.6, 32, 16)`; break;
+                    case 'Plane': geoStr = `new THREE.PlaneGeometry(2, 2)`; break;
+                    case 'Torus': geoStr = `new THREE.TorusGeometry(0.5, 0.2, 16, 50)`; break;
+                    case 'Cylinder': geoStr = `new THREE.CylinderGeometry(0.5, 0.5, 1, 32)`; break;
+                }
+
+                meshCode += `
+        // Object ${index + 1} (${type})
+        {
+            const geometry = ${geoStr};
+            const material = new THREE.MeshStandardMaterial({ color: 0x${c}, side: THREE.DoubleSide${obj.material.wireframe ? ', wireframe: true' : ''} });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.set(${p.x.toFixed(3)}, ${p.y.toFixed(3)}, ${p.z.toFixed(3)});
+            mesh.rotation.set(${r.x.toFixed(3)}, ${r.y.toFixed(3)}, ${r.z.toFixed(3)});
+            mesh.scale.set(${s.x.toFixed(3)}, ${s.y.toFixed(3)}, ${s.z.toFixed(3)});
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+        }
+`;
+            });
+
+            const fullCode = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -6,7 +348,7 @@
     <style>body { margin: 0; overflow: hidden; }</style>
     <script type="importmap">
         { "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
-    </script>
+    <\/script>
 </head>
 <body>
     <script type="module">
@@ -36,20 +378,7 @@
         scene.add(dirLight);
 
         // --- Generated Objects ---
-
-        // Object 1 (Box)
-        {
-            const geometry = new THREE.BoxGeometry(1, 1, 1);
-            const material = new THREE.MeshStandardMaterial({ color: 0x00ff00, side: THREE.DoubleSide });
-            const mesh = new THREE.Mesh(geometry, material);
-            mesh.position.set(1.686, -0.980, -3.139);
-            mesh.rotation.set(0.000, 0.000, 0.000);
-            mesh.scale.set(4.000, 1.000, 1.000);
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-            scene.add(mesh);
-        }
-
+${meshCode}
         // -------------------------
 
         function animate() {
@@ -64,6 +393,29 @@
             camera.updateProjectionMatrix();
             renderer.setSize(window.innerWidth, window.innerHeight);
         });
+    <\/script>
+</body>
+</html>`;
+
+            document.getElementById('generated-code').value = fullCode;
+            document.getElementById('code-modal').style.display = 'flex';
+        }
+
+        document.getElementById('copy-btn').addEventListener('click', () => {
+            const copyText = document.getElementById("generated-code");
+            copyText.select();
+            document.execCommand("copy");
+            alert("Code copied to clipboard!");
+        });
+
+        // Loop
+        function animate() {
+            requestAnimationFrame(animate);
+            orbit.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
     </script>
 </body>
 </html>
